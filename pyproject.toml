@@ -1,0 +1,19 @@
+[project]
+name = "library-rag-ingest"
+version = "0.1.0"
+description = "CS 410 Group 3 - data ingestion pipeline"
+requires-python = ">=3.12"
+dependencies = [
+    "gdown>=5.2.1",
+    "httpx>=0.28.1",
+    "psycopg2-binary>=2.9.11",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
+    "tqdm>=4.67.3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["lib"]
+
+[tool.uv]
+package = false

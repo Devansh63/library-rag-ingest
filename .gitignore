@@ -1,0 +1,32 @@
+# Secrets - NEVER commit
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data (too large for git, also not ours to redistribute)
+data/raw/
+data/processed/
+data/*.jsonl
+data/*.json.gz
+data/*.csv
+data/*.zip
+data/*.tar.gz
+!data/.gitkeep
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# uv.lock is committed for reproducibility
