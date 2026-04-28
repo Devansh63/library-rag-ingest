@@ -168,6 +168,8 @@ def preflight_quota_check() -> int:
             spent = plan.get("spent", -1)
             print(f"  API quota: {left:,} remaining / {total:,} total ({spent:,} spent today)")
             return left
+        if resp.status_code == 401:
+            raise SystemExit(f"\nFATAL: ISBNdb API key rejected (401). Check ISBNDB_API_KEY.\n{resp.text[:120]}")
         print(f"  [preflight] HTTP {resp.status_code}: {resp.text[:80]}")
         return -1
     except requests.RequestException as exc:
@@ -220,6 +222,11 @@ def lookup_isbns_bulk(isbn_list: list[str], rate_limiter: RateLimiter) -> dict[s
             pass
         return {}
 
+    if resp.status_code == 401:
+        # Invalid or inactive key - abort immediately so no books get
+        # falsely stamped isbndb_not_found due to an auth failure.
+        raise SystemExit(f"\nFATAL: ISBNdb API key rejected (401). Check ISBNDB_API_KEY.\n{resp.text[:120]}")
+
     tqdm.write(f"  [HTTP {resp.status_code}] bulk failed: {resp.text[:120]}")
     return {}
 
@@ -254,9 +261,6 @@ def fetch_books_to_enrich(
       Priority 1: missing_description, Priority 2: missing_author only.
     """
     if review_boost:
-        # Pick unembedded goodreads_bbe/cmu books with the most reviews
-        # (but below max_reviews cap) that haven't been ISBNdb-checked yet.
-        # ISBNdb will add editorial reviews, boosting their review count.
         sql = f"""
             WITH
             isbn_counts AS (
@@ -371,12 +375,7 @@ def compute_new_flags(
 
 
 def extract_editorial_reviews(book_data: dict, isbn13: str) -> list[ReviewRow]:
-    """Extract editorial/professional reviews from an ISBNdb book response.
-
-    ISBNdb returns reviews as a list of strings or dicts. We store each one
-    as a ReviewRow with review_type='editorial' and user_id set to the
-    publication name when available.
-    """
+    """Extract editorial/professional reviews from an ISBNdb book response."""
     raw_reviews = book_data.get("reviews") or []
     rows = []
     for item in raw_reviews:
@@ -394,8 +393,8 @@ def extract_editorial_reviews(book_data: dict, isbn13: str) -> list[ReviewRow]:
 
         rows.append(ReviewRow(
             isbn13=isbn13,
-            user_id=publication,   # publication name goes in user_id field
-            rating=None,           # editorial reviews have no star rating
+            user_id=publication,
+            rating=None,
             review_text=text,
             date_posted=None,
             spoiler_flag=False,
@@ -406,26 +405,12 @@ def extract_editorial_reviews(book_data: dict, isbn13: str) -> list[ReviewRow]:
 
 
 def flush_book_updates(conn, updates: list[tuple], dry_run: bool) -> None:
-    """Batch-write enrichment results to the books table.
-
-    Each tuple:
-        (book_id, authors, synopsis, excerpt, cover_url, publisher,
-         pages, language, isbn10, edition, publish_date,
-         subjects_to_merge, dewey_decimal, new_cleaning_flags)
-
-    Overwrite strategy (ISBNdb is authoritative for catalog fields):
-        - isbn10, publisher, language, pages: ALWAYS overwrite when ISBNdb has a value
-        - authors, synopsis, short_description, cover_image_url,
-          edition, publish_date: fill NULL only
-        - subjects: merged (union of existing + new, deduplicated)
-        - dewey_decimal: fill NULL only (new column)
-    """
+    """Batch-write enrichment results to the books table."""
     if not updates or dry_run:
         return
 
     sql = """
         UPDATE books AS b SET
-            -- Fill NULL only: content fields where existing data may be richer
             authors           = CASE WHEN array_length(b.authors, 1) IS NULL
                                      THEN v.authors           ELSE b.authors           END,
             synopsis          = CASE WHEN b.synopsis          IS NULL
@@ -440,14 +425,10 @@ def flush_book_updates(conn, updates: list[tuple], dry_run: bool) -> None:
                                      THEN v.pub_date          ELSE b.publish_date      END,
             dewey_decimal     = CASE WHEN b.dewey_decimal      IS NULL
                                      THEN v.dewey             ELSE b.dewey_decimal     END,
-
-            -- Overwrite: ISBNdb is the authoritative catalog source for these
             isbn10            = COALESCE(v.isbn10,    b.isbn10),
             publisher         = COALESCE(v.publisher, b.publisher),
             language          = COALESCE(v.language,  b.language),
             pages             = COALESCE(v.pages,     b.pages),
-
-            -- Merge subjects: union of existing + ISBNdb, deduplicated
             subjects          = CASE
                                   WHEN v.subjects IS NULL THEN b.subjects
                                   WHEN array_length(b.subjects, 1) IS NULL THEN v.subjects
@@ -456,7 +437,6 @@ def flush_book_updates(conn, updates: list[tuple], dry_run: bool) -> None:
                                     FROM unnest(b.subjects || v.subjects) AS s
                                   )
                                 END,
-
             cleaning_flags    = v.new_flags
 
         FROM (VALUES %s) AS v(book_id, authors, synopsis, excerpt, cover_url,
@@ -520,7 +500,6 @@ def enrich(conn, args) -> None:  # noqa: C901
         return
     print()
 
-    # Counters
     enriched = 0
     not_found = 0
     checked_no_data = 0
@@ -544,7 +523,6 @@ def enrich(conn, args) -> None:  # noqa: C901
 
             isbn_list = [row[1] for row in batch]
 
-            # In dry-run mode skip real API calls entirely - just simulate hits.
             if args.dry_run:
                 found_map = {isbn: {"authors": ["Dry Run Author"],
                                     "synopsis": "Dry run placeholder synopsis."
@@ -561,7 +539,6 @@ def enrich(conn, args) -> None:  # noqa: C901
 
             found_map = lookup_isbns_bulk(isbn_list, rate_limiter)
 
-            # Pre-deduct so daily_exhausted() stays accurate next iteration.
             rate_limiter.daily_remaining = max(0, rate_limiter.daily_remaining - len(batch))
 
             for book_id, isbn13, old_flags in batch:
@@ -583,7 +560,6 @@ def enrich(conn, args) -> None:  # noqa: C901
                     else:
                         checked_no_data += 1
 
-                    # Collect editorial reviews - store them separately.
                     editorial = extract_editorial_reviews(bd, isbn13)
                     if editorial:
                         editorial_reviews_found += len(editorial)
@@ -591,7 +567,6 @@ def enrich(conn, args) -> None:  # noqa: C901
 
                 new_flags = compute_new_flags(old_flags, bd or None, was_not_found, was_enriched)
 
-                # Parse publish_date from ISBNdb's YYYY, YYYY-MM, or YYYY-MM-DD formats.
                 pub_date = None
                 date_raw = bd.get("date_published") or ""
                 if date_raw:
@@ -615,15 +590,15 @@ def enrich(conn, args) -> None:  # noqa: C901
                     book_id,
                     bd.get("authors") or None,
                     (bd.get("synopsis") or "").strip() or None,
-                    (bd.get("excerpt") or "").strip() or None,   # -> short_description
-                    bd.get("image") or None,                      # -> cover_image_url
-                    bd.get("publisher") or None,                  # OVERWRITE
-                    pages,                                         # OVERWRITE
-                    bd.get("language") or None,                   # OVERWRITE
-                    bd.get("isbn10") or None,                     # OVERWRITE
+                    (bd.get("excerpt") or "").strip() or None,
+                    bd.get("image") or None,
+                    bd.get("publisher") or None,
+                    pages,
+                    bd.get("language") or None,
+                    bd.get("isbn10") or None,
                     bd.get("edition") or None,
                     pub_date,
-                    bd.get("subjects") or None,                   # MERGE
+                    bd.get("subjects") or None,
                     bd.get("dewey_decimal") or None,
                     new_flags,
                 ))
@@ -636,18 +611,15 @@ def enrich(conn, args) -> None:  # noqa: C901
                 quota=rate_limiter.daily_remaining,
             )
 
-            # Flush book updates when buffer is full.
             if len(pending_book_updates) >= DB_FLUSH_SIZE:
                 flush_book_updates(conn, pending_book_updates, args.dry_run)
                 pending_book_updates.clear()
 
-            # Flush editorial reviews when buffer is full.
             if len(pending_editorial_reviews) >= DB_FLUSH_SIZE:
                 if not args.dry_run:
                     bulk_insert_reviews(conn, pending_editorial_reviews)
                 pending_editorial_reviews.clear()
 
-    # Final flush.
     if pending_book_updates:
         flush_book_updates(conn, pending_book_updates, args.dry_run)
     if pending_editorial_reviews and not args.dry_run:
@@ -699,7 +671,7 @@ def main() -> int:
     parser.add_argument("--daily-buffer", type=int, default=DEFAULT_DAILY_BUFFER,
                         help=f"Stop when daily remaining <= this (default {DEFAULT_DAILY_BUFFER}).")
     parser.add_argument("--dry-run", action="store_true",
-                        help="Make API calls but write nothing to the DB.")
+                        help="Simulate enrichment without writing to DB or calling API.")
     args = parser.parse_args()
 
     conn = get_connection()
