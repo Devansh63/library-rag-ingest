@@ -57,6 +57,8 @@ Usage:
   uv run python scripts/enrich_isbndb.py --limit 300
   uv run python scripts/enrich_isbndb.py --priority-only
   uv run python scripts/enrich_isbndb.py --daily-buffer 200
+  uv run python scripts/enrich_isbndb.py --review-boost --max-reviews 60 --limit 5000
+  uv run python scripts/enrich_isbndb.py --embed-prep --limit 5000
 """
 
 from __future__ import annotations
@@ -226,12 +228,93 @@ def lookup_isbns_bulk(isbn_list: list[str], rate_limiter: RateLimiter) -> dict[s
 # DB helpers
 # ---------------------------------------------------------------------------
 
-def fetch_books_to_enrich(conn, limit: Optional[int], priority_only: bool) -> list[tuple]:
+def fetch_books_to_enrich(
+    conn,
+    limit: Optional[int],
+    priority_only: bool,
+    embed_prep: bool = False,
+    review_boost: bool = False,
+    max_reviews: int = 60,
+) -> list[tuple]:
     """Fetch (id, isbn13, cleaning_flags) in priority order.
 
     Skips books already marked isbndb_not_found or isbndb_checked.
-    Priority 1: missing_description, Priority 2: missing_author only.
+
+    review_boost mode: targets unembedded goodreads_bbe/cmu_summaries books
+    that have isbn13 but fewer reviews than max_reviews. Orders by review
+    count DESC so the highest-signal books (closest to the threshold) go
+    first. ISBNdb adds editorial reviews which push these books over the
+    KMeans minimum. Every API call here is a book that will qualify for
+    the embedding queue after marking.
+
+    embed_prep mode: targets ucsd_graph books with 10+ reviews that have
+    not yet been cleaned or embedded.
+
+    Standard mode:
+      Priority 1: missing_description, Priority 2: missing_author only.
     """
+    if review_boost:
+        # Pick unembedded goodreads_bbe/cmu books with the most reviews
+        # (but below max_reviews cap) that haven't been ISBNdb-checked yet.
+        # ISBNdb will add editorial reviews, boosting their review count.
+        sql = f"""
+            WITH
+            isbn_counts AS (
+                SELECT isbn13, COUNT(*) AS cnt
+                FROM reviews WHERE isbn13 IS NOT NULL GROUP BY isbn13
+            ),
+            id_counts AS (
+                SELECT book_id, COUNT(*) AS cnt
+                FROM reviews WHERE book_id IS NOT NULL GROUP BY book_id
+            )
+            SELECT b.id, b.isbn13, b.cleaning_flags
+            FROM books b
+            LEFT JOIN isbn_counts ic  ON ic.isbn13   = b.isbn13
+            LEFT JOIN id_counts   idc ON idc.book_id = b.id
+            WHERE b.source IN ('goodreads_bbe', 'cmu_summaries')
+              AND b.isbn13 IS NOT NULL
+              AND b.metadata_embedding IS NULL
+              AND NOT ('isbndb_checked'   = ANY(COALESCE(b.cleaning_flags, ARRAY[]::text[])))
+              AND NOT ('isbndb_not_found' = ANY(COALESCE(b.cleaning_flags, ARRAY[]::text[])))
+              AND NOT ('EMBED_QUEUED'     = ANY(COALESCE(b.cleaning_flags, ARRAY[]::text[])))
+              AND (b.synopsis IS NOT NULL OR b.short_description IS NOT NULL OR b.plot_summary IS NOT NULL)
+              AND (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) < %s
+            ORDER BY (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) DESC
+            {"LIMIT " + str(limit) if limit else ""}
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (max_reviews,))
+            return cur.fetchall()
+
+    if embed_prep:
+        sql = f"""
+            WITH
+            isbn_counts AS (
+                SELECT isbn13, COUNT(*) AS cnt
+                FROM reviews WHERE isbn13 IS NOT NULL GROUP BY isbn13
+            ),
+            id_counts AS (
+                SELECT book_id, COUNT(*) AS cnt
+                FROM reviews WHERE book_id IS NOT NULL GROUP BY book_id
+            )
+            SELECT b.id, b.isbn13, b.cleaning_flags
+            FROM books b
+            LEFT JOIN isbn_counts ic  ON ic.isbn13   = b.isbn13
+            LEFT JOIN id_counts   idc ON idc.book_id = b.id
+            WHERE b.source = 'ucsd_graph'
+              AND b.isbn13 IS NOT NULL
+              AND b.metadata_embedding IS NULL
+              AND NOT ('CLEANED'          = ANY(COALESCE(b.cleaning_flags, ARRAY[]::text[])))
+              AND NOT ('isbndb_checked'   = ANY(COALESCE(b.cleaning_flags, ARRAY[]::text[])))
+              AND NOT ('isbndb_not_found' = ANY(COALESCE(b.cleaning_flags, ARRAY[]::text[])))
+              AND (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) >= 10
+            ORDER BY (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) DESC
+            {"LIMIT " + str(limit) if limit else ""}
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall()
+
     flag_filter = (
         "cleaning_flags @> ARRAY['missing_description']"
         if priority_only
@@ -395,26 +478,34 @@ def flush_book_updates(conn, updates: list[tuple], dry_run: bool) -> None:
 # Main enrichment loop
 # ---------------------------------------------------------------------------
 
-def enrich(conn, args) -> None:
+def enrich(conn, args) -> None:  # noqa: C901
     if not ISBNDB_API_KEY:
         print("ERROR: ISBNDB_API_KEY not set in .env", file=sys.stderr)
         sys.exit(1)
 
-    print("Pre-flight quota check...")
-    quota_left = preflight_quota_check()
-    if quota_left == 0:
-        print("No daily quota remaining. Try again after 00:00 UTC.")
-        return
-    if quota_left != -1 and quota_left <= args.daily_buffer:
-        print(f"Only {quota_left} calls remaining (<= buffer {args.daily_buffer}). Stopping.")
-        return
-
     rate_limiter = RateLimiter(daily_buffer=args.daily_buffer)
-    if quota_left > 0:
-        rate_limiter.daily_remaining = quota_left
+
+    if args.dry_run:
+        print("Pre-flight quota check... skipped (dry-run mode, no real API calls).")
+    else:
+        print("Pre-flight quota check...")
+        quota_left = preflight_quota_check()
+        if quota_left == 0:
+            print("No daily quota remaining. Try again after 00:00 UTC.")
+            return
+        if quota_left != -1 and quota_left <= args.daily_buffer:
+            print(f"Only {quota_left} calls remaining (<= buffer {args.daily_buffer}). Stopping.")
+            return
+        if quota_left > 0:
+            rate_limiter.daily_remaining = quota_left
 
     print("Fetching books to enrich from DB...")
-    all_books = fetch_books_to_enrich(conn, args.limit, args.priority_only)
+    all_books = fetch_books_to_enrich(
+        conn, args.limit, args.priority_only,
+        embed_prep=args.embed_prep,
+        review_boost=args.review_boost,
+        max_reviews=args.max_reviews,
+    )
     total = len(all_books)
     print(f"  {total:,} books queued for enrichment.")
 
@@ -452,6 +543,22 @@ def enrich(conn, args) -> None:
                 break
 
             isbn_list = [row[1] for row in batch]
+
+            # In dry-run mode skip real API calls entirely - just simulate hits.
+            if args.dry_run:
+                found_map = {isbn: {"authors": ["Dry Run Author"],
+                                    "synopsis": "Dry run placeholder synopsis."
+                                    } for isbn in isbn_list}
+                rate_limiter.daily_remaining = max(
+                    0, rate_limiter.daily_remaining - len(batch)
+                )
+                pbar.update(len(batch))
+                enriched += len(batch)
+                pbar.set_postfix(enriched=enriched, not_found=not_found,
+                                 editorial=editorial_reviews_found,
+                                 quota=rate_limiter.daily_remaining)
+                continue
+
             found_map = lookup_isbns_bulk(isbn_list, rate_limiter)
 
             # Pre-deduct so daily_exhausted() stays accurate next iteration.
@@ -582,6 +689,13 @@ def main() -> int:
                         help="Process at most N books (for testing).")
     parser.add_argument("--priority-only", action="store_true",
                         help="Only process missing_description books.")
+    parser.add_argument("--embed-prep", action="store_true",
+                        help="Target unembedded ucsd_graph books with 10+ reviews.")
+    parser.add_argument("--review-boost", action="store_true",
+                        help="Target unembedded goodreads_bbe/cmu books below --max-reviews, "
+                             "ordered by review count DESC. ISBNdb adds editorial reviews.")
+    parser.add_argument("--max-reviews", type=int, default=60,
+                        help="Upper review cap for --review-boost mode (default 60).")
     parser.add_argument("--daily-buffer", type=int, default=DEFAULT_DAILY_BUFFER,
                         help=f"Stop when daily remaining <= this (default {DEFAULT_DAILY_BUFFER}).")
     parser.add_argument("--dry-run", action="store_true",
