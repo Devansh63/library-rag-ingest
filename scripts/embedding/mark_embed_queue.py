@@ -117,7 +117,8 @@ def mark_best_books(conn, limit: int, dry_run: bool) -> int:
                         b.plot_summary      IS NOT NULL
                     )
                     -- Must have enough reviews for meaningful KMeans
-                    AND (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) >= 30
+                    -- Lowered from 30 to 10: k auto-adjusts down, still useful signal
+                    AND (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) >= 10
                     -- Skip already embedded
                     AND b.metadata_embedding IS NULL
                     -- Skip already queued
