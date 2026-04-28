@@ -1,4 +1,5 @@
-"""Query classifier for the hybrid search pipeline.
+"""
+Query classifier for the hybrid search pipeline.
 
 Uses Claude Haiku to classify an incoming search query into one of four types,
 then returns per-signal RRF weights (BM25 + metadata embedding + review embedding)
@@ -67,6 +68,7 @@ did not imply.
 Respond only by calling the classify_query tool with all fields filled in.\
 """
 
+# Tool schema - forces structured output via tool_choice.
 _CLASSIFY_TOOL = {
     "name": "classify_query",
     "description": "Classify a search query and return RRF scoring weights.",
@@ -99,8 +101,14 @@ _CLASSIFY_TOOL = {
                 "description": "One sentence explaining the classification decision.",
             },
         },
-        "required": ["query_type", "refined_query", "bm25_weight",
-                     "metadata_weight", "review_weight", "reasoning"],
+        "required": [
+            "query_type",
+            "refined_query",
+            "bm25_weight",
+            "metadata_weight",
+            "review_weight",
+            "reasoning",
+        ],
     },
 }
 
@@ -120,6 +128,16 @@ def classify_query(query: str) -> QueryClassification:
 
     Makes one Claude Haiku API call. The system prompt is prompt-cached so
     repeated calls pay ~0.1x on the cached portion.
+
+    Args:
+        query: Raw user search string.
+
+    Returns:
+        QueryClassification with query_type, refined_query, and per-signal weights.
+
+    Raises:
+        anthropic.APIError: On API failure.
+        ValueError: If the model returns an unexpected tool call name.
     """
     response = _client.messages.create(
         model="claude-haiku-4-5",
@@ -128,16 +146,20 @@ def classify_query(query: str) -> QueryClassification:
             {
                 "type": "text",
                 "text": _SYSTEM_PROMPT,
+                # Cache the system prompt - it never changes between requests.
                 "cache_control": {"type": "ephemeral"},
             }
         ],
         tools=[_CLASSIFY_TOOL],
+        # Force the model to always call classify_query - no free-text fallback.
         tool_choice={"type": "tool", "name": "classify_query"},
         messages=[{"role": "user", "content": query}],
     )
 
+    # Extract the tool call result.
     tool_block = next(
-        (b for b in response.content if b.type == "tool_use"), None
+        (b for b in response.content if b.type == "tool_use"),
+        None,
     )
     if tool_block is None or tool_block.name != "classify_query":
         raise ValueError(f"Unexpected response from classifier: {response.content}")
@@ -154,6 +176,7 @@ def classify_query(query: str) -> QueryClassification:
 
 
 if __name__ == "__main__":
+    # Quick smoke test - run with: uv run python lib/query_classifier.py
     test_queries = [
         "Harry Potter and the Chamber of Secrets",
         "dark atmospheric fantasy with morally grey characters",

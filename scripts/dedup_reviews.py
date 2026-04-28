@@ -1,4 +1,5 @@
-"""Remove duplicate rows from the reviews table, keeping the lowest id per group.
+"""
+Remove duplicate rows from the reviews table, keeping the lowest id per group.
 
 Duplicates were introduced by a --reviews-only re-stream pass that did not
 correctly honour the per-book cap for isbn-path reviews. The result is ~3.3M
@@ -48,7 +49,13 @@ def count_duplicates(conn) -> tuple[int, int]:
 
 
 def dedup_reviews(conn, batch_size: int, dry_run: bool) -> int:
-    """Delete duplicate review rows in batches, keeping the lowest id per group."""
+    """Delete duplicate review rows in batches, keeping the lowest id per group.
+
+    Returns the total number of rows deleted.
+    """
+    # Build a temp table of all ids to DELETE (every id that is NOT the min
+    # id in its group). We materialise this once so the repeated batch
+    # deletions don't re-run the GROUP BY each time.
     print("Building list of duplicate ids to delete...")
     with conn.cursor() as cur:
         cur.execute("""
@@ -76,6 +83,7 @@ def dedup_reviews(conn, batch_size: int, dry_run: bool) -> int:
     deleted = 0
     batch_num = 0
     while True:
+        # Grab a batch of IDs to delete.
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM reviews_to_delete LIMIT %s", (batch_size,))
             batch_ids = [row[0] for row in cur.fetchall()]
@@ -83,6 +91,7 @@ def dedup_reviews(conn, batch_size: int, dry_run: bool) -> int:
         if not batch_ids:
             break
 
+        # Delete from reviews, then remove those IDs from the temp table.
         with conn.cursor() as cur:
             cur.execute("DELETE FROM reviews WHERE id = ANY(%s)", (batch_ids,))
             rows_deleted = cur.rowcount
@@ -98,6 +107,7 @@ def dedup_reviews(conn, batch_size: int, dry_run: bool) -> int:
     with conn.cursor() as cur:
         cur.execute("DROP TABLE IF EXISTS reviews_to_delete")
     conn.commit()
+
     return deleted
 
 
@@ -129,8 +139,10 @@ def main() -> int:
 
     print(f"\nDeleting in batches of {args.batch_size:,}...")
     deleted = dedup_reviews(conn, args.batch_size, dry_run=False)
+
     print(f"\nDone. Deleted {deleted:,} duplicate rows.")
 
+    # Final count check.
     with conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) FROM reviews")
         final_count = cur.fetchone()[0]

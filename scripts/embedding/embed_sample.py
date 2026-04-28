@@ -42,7 +42,6 @@ FIRST RUN: downloads BAAI/bge-base-en-v1.5 (~440 MB) from HuggingFace.
 Usage:
     uv run python scripts/embedding/embed_sample.py
     uv run python scripts/embedding/embed_sample.py --dry-run
-    uv run python scripts/embedding/embed_sample.py --limit 5000
 """
 
 from __future__ import annotations
@@ -95,64 +94,91 @@ def to_pg_vector(arr: np.ndarray) -> str:
 # Book selection
 # ---------------------------------------------------------------------------
 
+QUEUED_MODE = False  # set to True via --queued flag
+
+
 def select_sample_books(conn) -> list[dict]:
-    """Select SAMPLE_SIZE random quality books with 30+ reviews.
+    """Select books to embed.
 
-    Uses setseed() so ORDER BY random() is reproducible - re-running the
-    script always picks the same books, which matters for comparing
-    embedding quality across code changes.
+    In QUEUED_MODE: picks books marked 'EMBED_QUEUED' by mark_embed_queue.py,
+    ordered by review count descending (richest KMeans signal first). This is
+    the mode used for deliberate multi-machine runs where books are pre-scored
+    and marked on the MacBook, then any machine processes the queue.
 
-    Review counts are pre-aggregated in CTEs (isbn path + book_id path)
-    and then joined, avoiding a correlated subquery that would scan 11M
-    review rows once per candidate book.
+    In default mode: selects SAMPLE_SIZE random quality books with 30+ reviews.
+    Uses setseed() for reproducible random() ordering across re-runs.
 
-    Books with metadata_embedding already set are skipped so re-runs and
-    parallel runs on different machines never overlap.
+    Review counts are pre-aggregated in CTEs to avoid a correlated subquery
+    scanning 11M rows once per candidate book.
     """
     print("Selecting sample books...")
     with conn.cursor() as cur:
-        cur.execute("SELECT setseed(%s)", (RANDOM_SEED,))
-        cur.execute("""
-            WITH
-            isbn_counts AS (
-                SELECT isbn13, COUNT(*) AS cnt
-                FROM reviews
-                WHERE isbn13 IS NOT NULL
-                GROUP BY isbn13
-            ),
-            id_counts AS (
-                SELECT book_id, COUNT(*) AS cnt
-                FROM reviews
-                WHERE book_id IS NOT NULL
-                GROUP BY book_id
-            )
-            SELECT
-                b.id,
-                b.title,
-                b.isbn13,
-                b.genres,
-                b.subjects,
-                b.synopsis,
-                b.short_description,
-                b.plot_summary
-            FROM books b
-            LEFT JOIN isbn_counts ic ON ic.isbn13 = b.isbn13
-            LEFT JOIN id_counts   idc ON idc.book_id = b.id
-            WHERE
-                (
-                    b.source IN ('goodreads_bbe', 'cmu_summaries')
-                    OR (b.source = 'ucsd_graph' AND 'CLEANED' = ANY(b.cleaning_flags))
+        if QUEUED_MODE:
+            cur.execute("""
+                WITH
+                isbn_counts AS (
+                    SELECT isbn13, COUNT(*) AS cnt
+                    FROM reviews WHERE isbn13 IS NOT NULL GROUP BY isbn13
+                ),
+                id_counts AS (
+                    SELECT book_id, COUNT(*) AS cnt
+                    FROM reviews WHERE book_id IS NOT NULL GROUP BY book_id
                 )
-                AND (
-                    b.synopsis          IS NOT NULL OR
-                    b.short_description IS NOT NULL OR
-                    b.plot_summary      IS NOT NULL
+                SELECT
+                    b.id, b.title, b.isbn13, b.genres, b.subjects,
+                    b.synopsis, b.short_description, b.plot_summary
+                FROM books b
+                LEFT JOIN isbn_counts ic  ON ic.isbn13   = b.isbn13
+                LEFT JOIN id_counts   idc ON idc.book_id = b.id
+                WHERE
+                    'EMBED_QUEUED' = ANY(b.cleaning_flags)
+                    AND b.metadata_embedding IS NULL
+                ORDER BY (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) DESC
+                LIMIT %s
+            """, (SAMPLE_SIZE,))
+        else:
+            cur.execute("SELECT setseed(%s)", (RANDOM_SEED,))
+            cur.execute("""
+                WITH
+                isbn_counts AS (
+                    SELECT isbn13, COUNT(*) AS cnt
+                    FROM reviews
+                    WHERE isbn13 IS NOT NULL
+                    GROUP BY isbn13
+                ),
+                id_counts AS (
+                    SELECT book_id, COUNT(*) AS cnt
+                    FROM reviews
+                    WHERE book_id IS NOT NULL
+                    GROUP BY book_id
                 )
-                AND (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) >= 30
-                AND b.metadata_embedding IS NULL  -- skip already-embedded books
-            ORDER BY random()
-            LIMIT %s
-        """, (SAMPLE_SIZE,))
+                SELECT
+                    b.id,
+                    b.title,
+                    b.isbn13,
+                    b.genres,
+                    b.subjects,
+                    b.synopsis,
+                    b.short_description,
+                    b.plot_summary
+                FROM books b
+                LEFT JOIN isbn_counts ic ON ic.isbn13 = b.isbn13
+                LEFT JOIN id_counts   idc ON idc.book_id = b.id
+                WHERE
+                    (
+                        b.source IN ('goodreads_bbe', 'cmu_summaries')
+                        OR (b.source = 'ucsd_graph' AND 'CLEANED' = ANY(b.cleaning_flags))
+                    )
+                    AND (
+                        b.synopsis          IS NOT NULL OR
+                        b.short_description IS NOT NULL OR
+                        b.plot_summary      IS NOT NULL
+                    )
+                    AND (COALESCE(ic.cnt, 0) + COALESCE(idc.cnt, 0)) >= 30
+                    AND b.metadata_embedding IS NULL  -- skip already-embedded books
+                ORDER BY random()
+                LIMIT %s
+            """, (SAMPLE_SIZE,))
 
         cols = [d[0] for d in cur.description]
         books = [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -335,7 +361,7 @@ def run(dry_run: bool = False) -> None:
         show_progress_bar=True,
         normalize_embeddings=True,  # cosine similarity works on normalized vecs
     )
-    print(f"  Done in {time.time() - t0:.1f}s --- {len(meta_vecs)} vectors")
+    print(f"  Done in {time.time() - t0:.1f}s -- {len(meta_vecs)} vectors")
 
     # ---- Phase 2: Review embeddings ----------------------------------------
     # Step 2a: collect ALL individual review texts across all books in one list,
@@ -460,6 +486,9 @@ if __name__ == "__main__":
                         help="Run everything except the DB write.")
     parser.add_argument("--limit", type=int, default=SAMPLE_SIZE,
                         help="How many books to embed in this run (default: 1000).")
+    parser.add_argument("--queued", action="store_true",
+                        help="Only process books marked EMBED_QUEUED by mark_embed_queue.py.")
     args = parser.parse_args()
     SAMPLE_SIZE = args.limit
+    QUEUED_MODE = args.queued
     run(dry_run=args.dry_run)
