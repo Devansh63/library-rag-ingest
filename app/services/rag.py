@@ -14,6 +14,33 @@ from app.services.search import hybrid_search
 
 logger = logging.getLogger(__name__)
 
+_MAX_CHAT_TURNS_CLIENT = 32  # alternating user/assistant (each counts as one entry)
+_SEARCH_BLURB_MAX = 600
+_LIBRARIAN_CHAT_SYSTEM = """\
+You are a friendly, witty librarian chatting with a reader in a natural back-and-forth (like ChatGPT).
+
+Use the ongoing conversation—you may clarify tastes, riff on moods, joke lightly, ask a short follow-up,
+or tighten suggestions when they push back ("too long", "edgier", "more literary"). Keep replies readable:
+short paragraphs unless they ask for depth.
+
+IMPORTANT: Facts about specific books—titles, authors, stars, synopsis details—must come ONLY from the
+"CATALOG excerpts" block attached to their latest message. If that block is thin or missing, say what you
+know from the conversation and suggest they try a vaguer mood or genre; do not invent books.
+
+Respond as plain text/Markdown; no faux JSON."""
+
+
+def _collapse_adjacent_roles(turns: list[dict[str, str]]) -> list[dict[str, str]]:
+    """Groq prefers strict user/assistant alternation—merge back-to-back same roles."""
+    out: list[dict[str, str]] = []
+    for m in turns:
+        if out and out[-1]["role"] == m["role"]:
+            prev = out[-1]["content"]
+            out[-1] = {"role": m["role"], "content": prev + "\n\n" + m["content"]}
+        else:
+            out.append(dict(m))
+    return out
+
 
 def _format_book_context(books: list[dict]) -> str:
     parts = []
@@ -56,8 +83,101 @@ INSTRUCTIONS:
 Provide your recommendations below:"""
 
 
+def _search_query_from_thread(messages: list[dict[str, str]]) -> str:
+    """Squash recent user utterances into one retrieval string."""
+    chunks: list[str] = []
+    for m in messages:
+        if m.get("role") == "user":
+            t = str(m.get("content", "")).strip()
+            if t:
+                chunks.append(t)
+    joined = "\n".join(chunks)[-_SEARCH_BLURB_MAX:]
+    return joined.strip() or (chunks[-1] if chunks else "")
+
+
+async def conversational_recommendations(
+    messages: list[dict[str, str]],
+    *,
+    catalog_limit: int,
+) -> dict:
+    """Multi-turn librarian chat: fresh hybrid retrieval each user reply + Groq dialog."""
+
+    sanitized: list[dict[str, str]] = []
+    for m in messages:
+        role = str(m.get("role", "")).lower().strip()
+        content = str(m.get("content", "")).strip()
+        if role not in ("user", "assistant") or not content:
+            continue
+        if len(content) > 12000:
+            content = content[:12000] + "…"
+        sanitized.append({"role": role, "content": content})
+
+    sanitized = _collapse_adjacent_roles(sanitized)[-_MAX_CHAT_TURNS_CLIENT:]
+
+    if not sanitized or sanitized[-1]["role"] != "user":
+        return {
+            "error": "invalid_messages",
+            "detail": "Send a non-empty transcript ending with a user message.",
+            "messages": sanitized,
+            "assistant_reply": None,
+            "books": [],
+        }
+
+    search_q = _search_query_from_thread(sanitized)
+    classified = classify_query(search_q[-500:] if search_q else "books")
+    books = hybrid_search(classified, limit=settings.rag_top_k)
+
+    plain_last = sanitized[-1]["content"]
+
+    if not books:
+        no_match_note = (
+            "\n\n--- CATALOG excerpts (ground book facts here)\n---\n"
+            "(No catalogue rows scored well this round—be honest, stay conversational, invite them to widen or tweak the vibe.)"
+        )
+        augmented = plain_last + no_match_note
+        reply: str | None = None
+        if settings.groq_api_key:
+            try:
+                reply = await _call_groq_multiturn(sanitized[:-1], augmented)
+            except Exception as e:
+                logger.error("Groq chat failed (empty catalog): %s", e)
+        if reply is None:
+            reply = (
+                "I'm not pulling strong catalogue hits yet—tell me softer constraints "
+                '(pace, comps, mood) or swap genre a bit and I\'ll hunt again!'
+            )
+
+        return {
+            "messages": sanitized + [{"role": "assistant", "content": reply}],
+            "assistant_reply": reply,
+            "books": [],
+            "query_type": classified.query_type,
+        }
+
+    context = _format_book_context(books)
+    augmented = plain_last + (
+        "\n\n--- CATALOG excerpts (ground book facts here)\n---\n" + context
+    )
+
+    if settings.groq_api_key:
+        try:
+            recommendation = await _call_groq_multiturn(sanitized[:-1], augmented)
+        except Exception as e:
+            logger.error("Groq chat RAG failed: %s", e)
+            recommendation = _fallback_recommendation(books, plain_last)
+    else:
+        recommendation = _fallback_recommendation(books, plain_last)
+
+    return {
+        "messages": sanitized + [{"role": "assistant", "content": recommendation}],
+        "assistant_reply": recommendation,
+        "query_type": classified.query_type,
+        "books": books[:catalog_limit],
+    }
+
+
 async def generate_recommendations(query: str, limit: int = 5) -> dict:
-    """Full RAG pipeline: classify → search → retrieve → generate."""
+    """Single-shot RAG pipeline: classify → search → retrieve → generate."""
     classified = classify_query(query)
     books = hybrid_search(classified, limit=settings.rag_top_k)
 
@@ -70,7 +190,6 @@ async def generate_recommendations(query: str, limit: int = 5) -> dict:
         }
 
     context = _format_book_context(books)
-    recommendation = None
 
     if settings.groq_api_key:
         try:
@@ -89,13 +208,44 @@ async def generate_recommendations(query: str, limit: int = 5) -> dict:
     }
 
 
+async def _call_groq_multiturn(
+    prior_turns: list[dict[str, str]],
+    final_user_payload: str,
+) -> str:
+    """Groq Chat Completions with full thread + augmented final user bubble."""
+    from openai import AsyncOpenAI
+
+    pt = list(prior_turns)
+    while pt and pt[0]["role"] == "assistant":
+        pt = pt[1:]
+
+    client = AsyncOpenAI(
+        api_key=settings.groq_api_key,
+        base_url=settings.groq_base_url,
+        timeout=90.0,
+    )
+    messages: list[dict[str, str]] = [{"role": "system", "content": _LIBRARIAN_CHAT_SYSTEM}]
+    messages.extend(pt)
+    messages.append({"role": "user", "content": final_user_payload})
+
+    response = await client.chat.completions.create(
+        model=settings.rag_model,
+        messages=messages,
+        max_tokens=1024,
+        temperature=0.75,
+    )
+    raw = response.choices[0].message.content
+    return (raw or "").strip() or "(No reply text returned.)"
+
+
 async def _call_groq(query: str, context: str) -> str:
     """Call Groq API for RAG recommendation. Uses OpenAI-compatible format."""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(
         api_key=settings.groq_api_key,
-        base_url="https://api.groq.com/openai/v1",
+        base_url=settings.groq_base_url,
+        timeout=90.0,
     )
     prompt = _build_rag_prompt(query, context)
 

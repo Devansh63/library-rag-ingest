@@ -38,6 +38,7 @@ def database_stats():
         SELECT COUNT(*) AS total_books,
             COUNT(*) FILTER (WHERE isbn13 IS NOT NULL) AS with_isbn,
             COUNT(*) FILTER (WHERE metadata_embedding IS NOT NULL) AS with_embeddings,
+            COUNT(*) FILTER (WHERE search_tsv IS NOT NULL) AS with_search_tsv,
             COUNT(*) FILTER (WHERE synopsis IS NOT NULL) AS with_synopsis,
             COUNT(*) FILTER (WHERE array_length(authors, 1) > 0) AS with_authors,
             ROUND(AVG(goodreads_rating)::numeric, 2) AS avg_rating

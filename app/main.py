@@ -1,18 +1,18 @@
 """
 FastAPI app — Library RAG Search & Recommendations.
 
-Sits inside Devansh's library-rag-ingest repo alongside lib/ and scripts/.
-Uses the same .env file (DATABASE_URL_1, ANTHROPIC_API_KEY).
+Uses ``.env`` for ``DATABASE_URL_1``, ``GROQ_API_KEY`` (optional), etc.
 
-Run with: uvicorn app.main:app --reload --port 8000
+Run with: ``uvicorn app.main:app --reload --port 8000``
 """
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,20 +27,18 @@ logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
 
+# Bumped when search schema, routes, or response shapes change meaningfully.
+API_VERSION = "1.2.0"
+
 
 def _ensure_search_infrastructure():
     """Create search indexes and missing tables. Idempotent."""
     statements = [
-        # GIN index for BM25 full-text search
-        """CREATE INDEX IF NOT EXISTS idx_books_fts ON books USING gin(
-            to_tsvector('english',
-                coalesce(title, '') || ' ' ||
-                coalesce(array_to_string(authors, ' '), '') || ' ' ||
-                coalesce(synopsis, '') || ' ' ||
-                coalesce(array_to_string(genres, ' '), '') || ' ' ||
-                coalesce(array_to_string(subjects, ' '), '')
-            )
-        )""",
+        # BM25: stored tsvector + GIN (expression index on array_to_string fails — not IMMUTABLE).
+        """ALTER TABLE books ADD COLUMN IF NOT EXISTS search_tsv tsvector""",
+        """CREATE INDEX IF NOT EXISTS idx_books_search_tsv ON books USING gin (search_tsv)
+            WHERE search_tsv IS NOT NULL""",
+        """DROP INDEX IF EXISTS idx_books_fts""",
         # HNSW index for metadata vector search
         """DO $$ BEGIN
             IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'vector') THEN
@@ -81,6 +79,21 @@ def _ensure_search_infrastructure():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not os.environ.get("DATABASE_URL_1"):
+        logger.warning(
+            "DATABASE_URL_1 is not set — copy .env.example to .env and add your Neon URL. "
+            "The UI at / still loads; catalog and search API routes will fail until the database is configured."
+        )
+        app.state.database_configured = False
+        if settings.groq_api_key:
+            logger.info("Groq API key found — RAG will work once DATABASE_URL_1 is set.")
+        else:
+            logger.info("No Groq key — RAG will use fallback mode when the DB is configured.")
+        yield
+        logger.info("Shutdown complete.")
+        return
+
+    app.state.database_configured = True
     logger.info("Testing database connection...")
     conn = get_connection()
     conn.close()
@@ -97,9 +110,21 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Library RAG — Search & Recommendations",
-    description="Hybrid search (BM25 + pgvector) with RAG recommendations.",
-    version="1.0.0",
+    description=(
+        "Hybrid search: BM25 over ``books.search_tsv`` (GIN; backfill via "
+        "``scripts/backfill_search_tsv.py``), metadata and review vectors "
+        "(pgvector), fused with RRF. RAG recommendations via Groq when "
+        "``GROQ_API_KEY`` is set. Inventory and analytics endpoints included."
+    ),
+    version=API_VERSION,
     lifespan=lifespan,
+    openapi_tags=[
+        {"name": "search", "description": "Hybrid, keyword-only, and semantic search."},
+        {"name": "books", "description": "Book detail, reviews, and RAG recommendations."},
+        {"name": "inventory", "description": "Availability, borrow, return, renew."},
+        {"name": "analytics", "description": "Stats, genres, popular borrows."},
+        {"name": "health", "description": "Service liveness and configuration flags."},
+    ],
 )
 
 app.add_middleware(
@@ -122,12 +147,25 @@ def root():
     index = STATIC_DIR / "index.html"
     if index.exists():
         return FileResponse(index)
-    return {"service": "Library RAG API", "status": "running", "docs": "/docs"}
+    return {
+        "service": "Library RAG API",
+        "status": "running",
+        "version": API_VERSION,
+        "docs": "/docs",
+    }
 
 
 @app.get("/health", tags=["health"])
-def health():
-    return {"service": "Library RAG API", "status": "running", "docs": "/docs"}
+def health(request: Request):
+    """Liveness plus whether DATABASE_URL_1 was present at startup."""
+    db_ok = getattr(request.app.state, "database_configured", False)
+    return {
+        "service": "Library RAG API",
+        "status": "running" if db_ok else "degraded",
+        "version": API_VERSION,
+        "database_configured": bool(db_ok),
+        "docs": "/docs",
+    }
 
 
 # Mount static files last so API routes take priority

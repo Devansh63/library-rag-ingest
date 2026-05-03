@@ -1,7 +1,7 @@
 """
 Query Classifier — wraps lib/query_classifier.py (Groq-based).
 
-Uses Groq (llama-3.1-8b-instant, free tier) to classify queries into 4 types:
+Uses Groq (``GROQ_CLASSIFIER_MODEL``, default llama-3.1-8b-instant) to classify queries into 4 types:
     exact      — known title/author/ISBN         (BM25-heavy)
     thematic   — mood/vibe in reader language     (review-embedding-heavy)
     attribute  — structured properties/genres     (metadata-embedding-heavy)
@@ -33,7 +33,7 @@ class ClassifiedQuery:
 
 def classify_query(query: str) -> ClassifiedQuery:
     """
-    Classify using Groq (llama-3.1-8b-instant).
+    Classify using Groq (see ``GROQ_CLASSIFIER_MODEL`` in ``.env``).
     Falls back to heuristics if the API call fails.
     """
     try:

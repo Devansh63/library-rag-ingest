@@ -40,56 +40,66 @@ def embed_query(text: str) -> list[float]:
 # ---------------------------------------------------------------------------
 
 def bm25_search(query: str, limit: int = 50) -> list[dict]:
-    """BM25 keyword search using Postgres full-text search."""
+    """BM25 keyword search using Postgres full-text search.
+
+    Only rows with ``search_tsv`` set participate in FTS (GIN index, no NULL
+    scan). ``MATERIALIZED`` CTEs keep the fallback branches from re-planning
+    the FTS leg. ISBN matches run in a separate cheap leg so we skip the
+    ILIKE/unnest scan when an ISBN hit exists. Run
+    ``scripts/backfill_search_tsv.py`` for full coverage.
+    """
     sql = """
-        WITH fts AS (
+        WITH q AS (
+            SELECT plainto_tsquery('english', %(query)s) AS tq
+        ),
+        fts AS MATERIALIZED (
             SELECT
                 b.id, b.isbn13, b.title, b.authors, b.genres, b.synopsis,
                 b.goodreads_rating, b.num_ratings, b.cover_image_url,
-                ts_rank_cd(
-                    to_tsvector('english',
-                        coalesce(b.title, '') || ' ' ||
-                        coalesce(array_to_string(b.authors, ' '), '') || ' ' ||
-                        coalesce(b.synopsis, '') || ' ' ||
-                        coalesce(array_to_string(b.genres, ' '), '') || ' ' ||
-                        coalesce(array_to_string(b.subjects, ' '), '')
-                    ),
-                    plainto_tsquery('english', %(query)s)
-                ) AS rank
+                ts_rank_cd(b.search_tsv, q.tq) AS rank
             FROM books b
-            WHERE to_tsvector('english',
-                    coalesce(b.title, '') || ' ' ||
-                    coalesce(array_to_string(b.authors, ' '), '') || ' ' ||
-                    coalesce(b.synopsis, '') || ' ' ||
-                    coalesce(array_to_string(b.genres, ' '), '') || ' ' ||
-                    coalesce(array_to_string(b.subjects, ' '), '')
-                ) @@ plainto_tsquery('english', %(query)s)
+            INNER JOIN q ON (b.search_tsv @@ q.tq)
+            WHERE b.search_tsv IS NOT NULL
             ORDER BY rank DESC
             LIMIT %(limit)s
-        )
-        SELECT * FROM fts WHERE rank > 0
-
-        UNION ALL
-
-        (
+        ),
+        fts_ok AS (
+            SELECT * FROM fts WHERE rank > 0
+        ),
+        isbn_fb AS MATERIALIZED (
             SELECT
                 b.id, b.isbn13, b.title, b.authors, b.genres, b.synopsis,
                 b.goodreads_rating, b.num_ratings, b.cover_image_url,
-                0.01 AS rank
+                0.01::double precision AS rank
             FROM books b
             WHERE NOT EXISTS (SELECT 1 FROM fts)
-            AND (
-                b.title ILIKE '%%' || %(query)s || '%%'
-                OR EXISTS (
-                    SELECT 1 FROM unnest(b.authors) AS a
-                    WHERE a ILIKE '%%' || %(query)s || '%%'
-                )
-                OR b.isbn13 = %(query)s
-                OR b.isbn10 = %(query)s
-            )
+              AND (b.isbn13 = %(query)s OR b.isbn10 = %(query)s)
+            ORDER BY b.num_ratings DESC NULLS LAST
+            LIMIT %(limit)s
+        ),
+        like_fb AS (
+            SELECT
+                b.id, b.isbn13, b.title, b.authors, b.genres, b.synopsis,
+                b.goodreads_rating, b.num_ratings, b.cover_image_url,
+                0.01::double precision AS rank
+            FROM books b
+            WHERE NOT EXISTS (SELECT 1 FROM fts)
+              AND NOT EXISTS (SELECT 1 FROM isbn_fb)
+              AND (
+                  b.title ILIKE '%%' || %(query)s || '%%'
+                  OR EXISTS (
+                      SELECT 1 FROM unnest(b.authors) AS a
+                      WHERE a ILIKE '%%' || %(query)s || '%%'
+                  )
+              )
             ORDER BY b.num_ratings DESC NULLS LAST
             LIMIT %(limit)s
         )
+        SELECT * FROM fts_ok
+        UNION ALL
+        SELECT * FROM isbn_fb
+        UNION ALL
+        SELECT * FROM like_fb
     """
     return execute_query(sql, {"query": query, "limit": limit})
 

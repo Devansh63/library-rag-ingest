@@ -16,9 +16,7 @@ services:
     envVars:
       - key: DATABASE_URL_1
         sync: false                 # you'll set this manually in Render dashboard
-      - key: ANTHROPIC_API_KEY
-        sync: false
       - key: GROQ_API_KEY
-        sync: false
+        sync: false                  # query classifier + RAG (OpenAI-compatible Groq API)
       - key: PYTHON_VERSION
         value: "3.12.3"

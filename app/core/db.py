@@ -28,3 +28,19 @@ def execute_write(sql: str, params: dict | tuple | list | None = None) -> int:
         raise
     finally:
         conn.close()
+
+
+def execute_write_fetch(sql: str, params: dict | tuple | list | None = None) -> list[dict]:
+    """INSERT/UPDATE/DELETE with RETURNING — commit so rows persist."""
+    conn = get_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = [dict(row) for row in cur.fetchall()]
+        conn.commit()
+        return rows
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

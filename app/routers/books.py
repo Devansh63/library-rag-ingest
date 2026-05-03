@@ -1,10 +1,27 @@
 """Book detail, review, and recommendation endpoints."""
 from __future__ import annotations
-from fastapi import APIRouter, Query, HTTPException
+
+from typing import Literal
+
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, Field
+
 from app.core.db import execute_query
-from app.services.rag import generate_recommendations
+from app.services.rag import conversational_recommendations, generate_recommendations
 
 router = APIRouter(tags=["books"])
+
+
+class ChatTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(..., min_length=1, max_length=16000)
+
+
+class RecommendChatBody(BaseModel):
+    """Conversation turns (must end with a user message)."""
+
+    messages: list[ChatTurn] = Field(..., min_length=1)
+    limit: int = Field(default=5, ge=1, le=10)
 
 
 @router.get("/books/{isbn13}")
@@ -40,5 +57,15 @@ def get_book_reviews(isbn13: str, limit: int = Query(default=20, ge=1, le=100),
 
 @router.get("/recommend")
 async def recommend(q: str = Query(..., min_length=3), limit: int = Query(default=5, ge=1, le=10)):
-    """RAG-powered book recommendations."""
+    """One-shot RAG recommendations (backward compatible)."""
     return await generate_recommendations(q, limit=limit)
+
+
+@router.post("/recommend/chat")
+async def recommend_chat(body: RecommendChatBody):
+    """Multi-turn librarian chat: retrieval each turn + Groq dialog."""
+    payload = [{"role": t.role, "content": t.content} for t in body.messages]
+    result = await conversational_recommendations(payload, catalog_limit=body.limit)
+    if result.get("error") == "invalid_messages":
+        raise HTTPException(status_code=400, detail=result.get("detail", "Invalid transcript."))
+    return result

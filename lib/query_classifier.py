@@ -21,23 +21,45 @@ Usage:
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
-from openai import OpenAI
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-# Groq exposes an OpenAI-compatible API - same SDK, different base_url.
-_client = OpenAI(
-    base_url="https://api.groq.com/openai/v1",
-    # Reads GROQ_API_KEY from environment automatically.
-    api_key=__import__("os").environ.get("GROQ_API_KEY", ""),
-)
+_groq_client_singleton: OpenAI | None = None
+_groq_client_sig: tuple[str, str, str] | None = None
 
-# Fast, free model on Groq - handles classification reliably.
-_MODEL = "llama-3.1-8b-instant"
+
+def _groq_base_url() -> str:
+    return (os.environ.get("GROQ_BASE_URL") or "https://api.groq.com/openai/v1").rstrip(
+        "/"
+    )
+
+
+def _classifier_model() -> str:
+    return os.environ.get("GROQ_CLASSIFIER_MODEL") or "llama-3.1-8b-instant"
+
+
+def _groq_client() -> OpenAI:
+    """Build or refresh client when ``GROQ_*`` env vars change (e.g. key rotation)."""
+    global _groq_client_singleton, _groq_client_sig
+    sig = (
+        os.environ.get("GROQ_API_KEY", ""),
+        _groq_base_url(),
+        _classifier_model(),
+    )
+    if _groq_client_singleton is None or _groq_client_sig != sig:
+        _groq_client_singleton = OpenAI(
+            base_url=sig[1],
+            api_key=sig[0],
+            timeout=60.0,
+        )
+        _groq_client_sig = sig
+    return _groq_client_singleton
 
 _SYSTEM_PROMPT = """\
 You are a query classifier for a library book search and recommendation system.
@@ -133,8 +155,8 @@ class QueryClassification:
 def classify_query(query: str) -> QueryClassification:
     """Classify a search query and return RRF scoring weights.
 
-    Makes one Groq API call (free tier). Uses llama-3.1-8b-instant for
-    low latency on every search request.
+    Makes one Groq API call (free tier). Model: ``GROQ_CLASSIFIER_MODEL``
+    (default ``llama-3.1-8b-instant``).
 
     Args:
         query: Raw user search string.
@@ -143,11 +165,11 @@ def classify_query(query: str) -> QueryClassification:
         QueryClassification with query_type, refined_query, and per-signal weights.
 
     Raises:
-        openai.APIError: On API failure.
+        openai.APIError: On Groq / HTTP API failure.
         ValueError: If the model returns no tool call or unexpected data.
     """
-    response = _client.chat.completions.create(
-        model=_MODEL,
+    response = _groq_client().chat.completions.create(
+        model=_classifier_model(),
         max_tokens=256,
         temperature=0.0,
         messages=[

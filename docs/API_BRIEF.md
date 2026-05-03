@@ -43,7 +43,7 @@ Every search query goes through a three-stage pipeline: **classify → retrieve 
 
 ### Stage 1: Query Classification
 
-The classifier determines what kind of query the user typed and sets per-signal weights accordingly. It first tries the Claude Haiku classifier (`lib/query_classifier.py`), which uses an API call to classify into one of four types. If no `ANTHROPIC_API_KEY` is set, it falls back to a local heuristic classifier.
+The classifier determines what kind of query the user typed and sets per-signal weights accordingly. It first calls Groq (`lib/query_classifier.py`, OpenAI-compatible client, model from `GROQ_CLASSIFIER_MODEL`) when `GROQ_API_KEY` is set. If the call fails or the key is missing, it falls back to a local heuristic classifier.
 
 | Query Type | Example | BM25 | Metadata | Review |
 |---|---|---|---|---|

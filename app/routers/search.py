@@ -9,20 +9,26 @@ router = APIRouter(prefix="/search", tags=["search"])
 
 @router.get("")
 def search(q: str = Query(..., min_length=1), limit: int = Query(default=20, ge=1, le=100)):
-    """Hybrid search with automatic query classification."""
+    """Hybrid search with automatic query classification (BM25 + vectors, RRF)."""
     classified = classify_query(q)
     results = hybrid_search(classified, limit=limit)
     return {
-        "query": q, "query_type": classified.query_type,
-        "weights": {"keyword": classified.weight_keyword, "metadata": classified.weight_metadata, "review": classified.weight_review},
+        "query": q,
+        "query_type": classified.query_type,
+        "weights": {
+            "keyword": classified.weight_keyword,
+            "metadata": classified.weight_metadata,
+            "review": classified.weight_review,
+        },
         "reasoning": classified.reasoning,
-        "total": len(results), "results": results,
+        "total": len(results),
+        "results": results,
     }
 
 
 @router.get("/keyword")
 def search_keyword(q: str = Query(..., min_length=1), limit: int = Query(default=20, ge=1, le=100)):
-    """BM25 keyword-only search."""
+    """BM25 / full-text search over ``books.search_tsv`` (see backfill script in repo)."""
     results = keyword_only_search(q, limit=limit)
     return {"query": q, "query_type": "keyword_only", "total": len(results), "results": results}
 

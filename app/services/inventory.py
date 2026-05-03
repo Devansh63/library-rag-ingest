@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 from app.core.config import settings
-from app.core.db import execute_query
+from app.core.db import execute_query, execute_write_fetch
 
 
 def get_book_availability(isbn13: str) -> dict:
@@ -34,7 +34,7 @@ def borrow_book(isbn13: str, user_id: str) -> dict:
         return {"error": "No copies available"}
     inv_id = available[0]["inventory_id"]
     due = date.today() + timedelta(days=settings.max_borrow_days)
-    result = execute_query("""
+    result = execute_write_fetch("""
         INSERT INTO borrows (inventory_id, user_id, borrow_date, due_date, status, renewed_count)
         VALUES (%(inv_id)s, %(user_id)s, CURRENT_DATE, %(due)s, 'active', 0)
         RETURNING id, borrow_date, due_date
@@ -45,7 +45,7 @@ def borrow_book(isbn13: str, user_id: str) -> dict:
 
 
 def return_book(borrow_id: int) -> dict:
-    result = execute_query("""
+    result = execute_write_fetch("""
         UPDATE borrows SET return_date = CURRENT_DATE, status = 'returned'
         WHERE id = %(id)s AND status = 'active'
         RETURNING id, return_date
@@ -62,7 +62,7 @@ def renew_book(borrow_id: int) -> dict:
     if rows[0]["renewed_count"] >= settings.max_renewals:
         return {"error": f"Max renewals ({settings.max_renewals}) reached"}
     new_due = rows[0]["due_date"] + timedelta(days=settings.max_borrow_days)
-    result = execute_query("""
+    result = execute_write_fetch("""
         UPDATE borrows SET due_date = %(due)s, renewed_count = renewed_count + 1
         WHERE id = %(id)s RETURNING id, due_date, renewed_count
     """, {"id": borrow_id, "due": new_due})

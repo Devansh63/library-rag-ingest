@@ -1,9 +1,11 @@
 """
 Application settings — reads from the same .env file.
 
-Database connection: lib/db.get_connection() (reads DATABASE_URL_1)
-Query classifier:   lib/query_classifier.py (reads ANTHROPIC_API_KEY)
-RAG pipeline:       uses Groq (reads GROQ_API_KEY)
+Database connection: ``lib.db.get_connection()`` (``DATABASE_URL_1``)
+
+Groq (OpenAI-compatible HTTP API): ``GROQ_API_KEY`` plus optional
+``GROQ_BASE_URL``, ``GROQ_CLASSIFIER_MODEL``, ``GROQ_RAG_MODEL`` — see
+``.env.example``.
 """
 from __future__ import annotations
 
@@ -27,9 +29,21 @@ class Settings:
     weight_review: float = 0.3
     weight_keyword: float = 0.3
 
-    # --- RAG (uses Groq — free tier) ---
+    # --- Groq (OpenAI-compatible SDK: base_url + API key) ---
     groq_api_key: str = field(default_factory=lambda: os.environ.get("GROQ_API_KEY", ""))
-    rag_model: str = "llama-3.3-70b-versatile"
+    groq_base_url: str = field(
+        default_factory=lambda: (
+            os.environ.get("GROQ_BASE_URL") or "https://api.groq.com/openai/v1"
+        ).rstrip("/")
+    )
+    groq_classifier_model: str = field(
+        default_factory=lambda: os.environ.get("GROQ_CLASSIFIER_MODEL")
+        or "llama-3.1-8b-instant"
+    )
+    rag_model: str = field(
+        default_factory=lambda: os.environ.get("GROQ_RAG_MODEL")
+        or "llama-3.3-70b-versatile"
+    )
     rag_top_k: int = 8
 
     # --- Inventory ---
