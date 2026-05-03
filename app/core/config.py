@@ -1,11 +1,13 @@
 """
 Application settings — reads from the same .env file.
 
-Database connection: ``lib.db.get_connection()`` (``DATABASE_URL_1``)
+Database connection: lib/db.get_connection() (reads DATABASE_URL_1)
+Query classifier:   lib/query_classifier.py (reads GROQ_API_KEY)
+Embeddings:         app/services/search.py  (reads HF_TOKEN)
+RAG pipeline:       app/services/rag.py     (reads GROQ_API_KEY)
 
-Groq (OpenAI-compatible HTTP API): ``GROQ_API_KEY`` plus optional
-``GROQ_BASE_URL``, ``GROQ_CLASSIFIER_MODEL``, ``GROQ_RAG_MODEL`` — see
-``.env.example``.
+Groq (OpenAI-compatible HTTP API): GROQ_API_KEY plus optional
+GROQ_BASE_URL, GROQ_CLASSIFIER_MODEL, GROQ_RAG_MODEL - see .env.example.
 """
 from __future__ import annotations
 
@@ -18,7 +20,7 @@ load_dotenv()
 
 @dataclass
 class Settings:
-    # --- Embeddings ---
+    # --- Embeddings (HuggingFace Inference API — no local model) ---
     embedding_model: str = "BAAI/bge-base-en-v1.5"
     embedding_dim: int = 768
 

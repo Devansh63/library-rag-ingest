@@ -5,11 +5,7 @@ uvicorn[standard]>=0.29.0
 # --- Database ---
 psycopg2-binary>=2.9.11
 
-# --- Embeddings & ML ---
-sentence-transformers>=3.0.0
-torch>=2.2.0
-numpy>=1.26.0
-scikit-learn>=1.4.0
+# --- Embeddings (via HuggingFace Inference API — no local model) ---
 
 # --- LLM APIs ---
 # openai<1.109 + httpx>=0.28 breaks Groq client (proxies kwarg removed from httpx.Client).
