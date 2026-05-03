@@ -1,13 +1,13 @@
 """
-Query Classifier — wraps lib/query_classifier.py (Claude Haiku-based).
+Query Classifier — wraps lib/query_classifier.py (Groq-based).
 
-Devansh's classifier uses Claude Haiku to classify queries into 4 types:
+Uses Groq (llama-3.1-8b-instant, free tier) to classify queries into 4 types:
     exact      — known title/author/ISBN         (BM25-heavy)
     thematic   — mood/vibe in reader language     (review-embedding-heavy)
     attribute  — structured properties/genres     (metadata-embedding-heavy)
     similarity — "books like X"                   (balanced embeddings)
 
-Falls back to lightweight heuristics if ANTHROPIC_API_KEY is not set
+Falls back to lightweight heuristics if GROQ_API_KEY is not set
 or the API call fails.
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ClassifiedQuery:
-    """Unified result for both Claude-based and fallback classification."""
+    """Unified result for both Groq-based and fallback classification."""
     original: str
     query_type: str
     cleaned: str
@@ -33,12 +33,12 @@ class ClassifiedQuery:
 
 def classify_query(query: str) -> ClassifiedQuery:
     """
-    Classify using Devansh's Claude Haiku classifier.
+    Classify using Groq (llama-3.1-8b-instant).
     Falls back to heuristics if the API call fails.
     """
     try:
-        from lib.query_classifier import classify_query as haiku_classify
-        result = haiku_classify(query)
+        from lib.query_classifier import classify_query as groq_classify
+        result = groq_classify(query)
         return ClassifiedQuery(
             original=query,
             query_type=result.query_type,
@@ -49,7 +49,7 @@ def classify_query(query: str) -> ClassifiedQuery:
             reasoning=result.reasoning,
         )
     except Exception as e:
-        logger.warning("Claude classifier failed (%s), using heuristic fallback", e)
+        logger.warning("Groq classifier failed (%s), using heuristic fallback", e)
         return _heuristic_fallback(query)
 
 

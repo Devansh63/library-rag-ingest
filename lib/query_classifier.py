@@ -1,40 +1,44 @@
 """
 Query classifier for the hybrid search pipeline.
 
-Uses Claude Haiku to classify an incoming search query into one of four types,
-then returns per-signal RRF weights (BM25 + metadata embedding + review embedding)
-tuned for that query type.
+Uses Groq (Llama 3.1 8B Instant) to classify an incoming search query into
+one of four types, then returns per-signal RRF weights (BM25 + metadata
+embedding + review embedding) tuned for that query type.
 
-Why Haiku: this runs on every search request, so latency and cost matter more
-than raw reasoning power. Classification is a simple enough task for Haiku.
-
-Why prompt caching: the system prompt is identical for every query. With caching,
-repeated calls pay ~0.1x input cost instead of full price.
+Why Groq: free tier, very low latency (~200ms), and classification is simple
+enough that a small fast model handles it reliably.
 
 Usage:
     from lib.query_classifier import classify_query
     result = classify_query("dark atmospheric fantasy novels")
-    # result.query_type     -> "thematic"
-    # result.refined_query  -> "dark atmospheric fantasy novels"
-    # result.bm25_weight    -> 0.1
+    # result.query_type      -> "thematic"
+    # result.refined_query   -> "dark atmospheric fantasy novels"
+    # result.bm25_weight     -> 0.1
     # result.metadata_weight -> 0.3
-    # result.review_weight  -> 0.6
+    # result.review_weight   -> 0.6
 """
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
-import anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
-# Load .env so ANTHROPIC_API_KEY is available when running scripts directly.
 load_dotenv(Path(__file__).parent.parent / ".env")
 
-_client = anthropic.Anthropic()
+# Groq exposes an OpenAI-compatible API - same SDK, different base_url.
+_client = OpenAI(
+    base_url="https://api.groq.com/openai/v1",
+    # Reads GROQ_API_KEY from environment automatically.
+    api_key=__import__("os").environ.get("GROQ_API_KEY", ""),
+)
 
-# System prompt is frozen - never interpolate dynamic content here or caching breaks.
+# Fast, free model on Groq - handles classification reliably.
+_MODEL = "llama-3.1-8b-instant"
+
 _SYSTEM_PROMPT = """\
 You are a query classifier for a library book search and recommendation system.
 
@@ -65,50 +69,53 @@ Also return a refined_query: clean up typos, expand obvious abbreviations,
 and strip filler words. Keep the meaning intact - do not add words the user
 did not imply.
 
-Respond only by calling the classify_query tool with all fields filled in.\
+You must respond by calling the classify_query function.\
 """
 
-# Tool schema - forces structured output via tool_choice.
+# OpenAI-format tool schema (Groq uses the same format).
 _CLASSIFY_TOOL = {
-    "name": "classify_query",
-    "description": "Classify a search query and return RRF scoring weights.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "query_type": {
-                "type": "string",
-                "enum": ["exact", "thematic", "attribute", "similarity"],
-                "description": "Query category.",
+    "type": "function",
+    "function": {
+        "name": "classify_query",
+        "description": "Classify a search query and return RRF scoring weights.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query_type": {
+                    "type": "string",
+                    "enum": ["exact", "thematic", "attribute", "similarity"],
+                    "description": "Query category.",
+                },
+                "refined_query": {
+                    "type": "string",
+                    "description": "Cleaned/expanded version of the query for retrieval.",
+                },
+                "bm25_weight": {
+                    "type": "number",
+                    "description": "Weight for BM25 keyword signal (0.0-1.0).",
+                },
+                "metadata_weight": {
+                    "type": "number",
+                    "description": "Weight for metadata embedding signal (0.0-1.0).",
+                },
+                "review_weight": {
+                    "type": "number",
+                    "description": "Weight for review embedding signal (0.0-1.0).",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "One sentence explaining the classification decision.",
+                },
             },
-            "refined_query": {
-                "type": "string",
-                "description": "Cleaned/expanded version of the query for retrieval.",
-            },
-            "bm25_weight": {
-                "type": "number",
-                "description": "Weight for BM25 keyword signal (0.0-1.0).",
-            },
-            "metadata_weight": {
-                "type": "number",
-                "description": "Weight for metadata embedding signal (0.0-1.0).",
-            },
-            "review_weight": {
-                "type": "number",
-                "description": "Weight for review embedding signal (0.0-1.0).",
-            },
-            "reasoning": {
-                "type": "string",
-                "description": "One sentence explaining the classification decision.",
-            },
+            "required": [
+                "query_type",
+                "refined_query",
+                "bm25_weight",
+                "metadata_weight",
+                "review_weight",
+                "reasoning",
+            ],
         },
-        "required": [
-            "query_type",
-            "refined_query",
-            "bm25_weight",
-            "metadata_weight",
-            "review_weight",
-            "reasoning",
-        ],
     },
 }
 
@@ -126,8 +133,8 @@ class QueryClassification:
 def classify_query(query: str) -> QueryClassification:
     """Classify a search query and return RRF scoring weights.
 
-    Makes one Claude Haiku API call. The system prompt is prompt-cached so
-    repeated calls pay ~0.1x on the cached portion.
+    Makes one Groq API call (free tier). Uses llama-3.1-8b-instant for
+    low latency on every search request.
 
     Args:
         query: Raw user search string.
@@ -136,35 +143,27 @@ def classify_query(query: str) -> QueryClassification:
         QueryClassification with query_type, refined_query, and per-signal weights.
 
     Raises:
-        anthropic.APIError: On API failure.
-        ValueError: If the model returns an unexpected tool call name.
+        openai.APIError: On API failure.
+        ValueError: If the model returns no tool call or unexpected data.
     """
-    response = _client.messages.create(
-        model="claude-haiku-4-5",
+    response = _client.chat.completions.create(
+        model=_MODEL,
         max_tokens=256,
-        system=[
-            {
-                "type": "text",
-                "text": _SYSTEM_PROMPT,
-                # Cache the system prompt - it never changes between requests.
-                "cache_control": {"type": "ephemeral"},
-            }
+        temperature=0.0,
+        messages=[
+            {"role": "system", "content": _SYSTEM_PROMPT},
+            {"role": "user", "content": query},
         ],
         tools=[_CLASSIFY_TOOL],
         # Force the model to always call classify_query - no free-text fallback.
-        tool_choice={"type": "tool", "name": "classify_query"},
-        messages=[{"role": "user", "content": query}],
+        tool_choice={"type": "function", "function": {"name": "classify_query"}},
     )
 
-    # Extract the tool call result.
-    tool_block = next(
-        (b for b in response.content if b.type == "tool_use"),
-        None,
-    )
-    if tool_block is None or tool_block.name != "classify_query":
-        raise ValueError(f"Unexpected response from classifier: {response.content}")
+    tool_calls = response.choices[0].message.tool_calls
+    if not tool_calls or tool_calls[0].function.name != "classify_query":
+        raise ValueError(f"Unexpected response from classifier: {response.choices[0].message}")
 
-    data = tool_block.input
+    data = json.loads(tool_calls[0].function.arguments)
     return QueryClassification(
         query_type=data["query_type"],
         refined_query=data["refined_query"],
