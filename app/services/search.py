@@ -20,7 +20,8 @@ from app.services.query_classifier import ClassifiedQuery
 logger = logging.getLogger(__name__)
 
 # Same model used to generate the stored embeddings - must not change.
-_HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-base-en-v1.5"
+# /models/ endpoint is the current HF Inference API path - /pipeline/ is deprecated.
+_HF_API_URL = "https://api-inference.huggingface.co/models/BAAI/bge-base-en-v1.5"
 
 
 def embed_query(text: str) -> list[float]:
@@ -41,7 +42,11 @@ def embed_query(text: str) -> list[float]:
         timeout=30.0,
     )
     response.raise_for_status()
-    vec: list[float] = response.json()
+
+    # /models/ endpoint returns a nested list: [[float, ...]] for a single input.
+    # Unwrap the outer list to get the flat 768-dim vector.
+    raw = response.json()
+    vec: list[float] = raw[0] if isinstance(raw[0], list) else raw
 
     # Normalize to unit vector - matches normalize_embeddings=True used during ingest.
     norm = math.sqrt(sum(x * x for x in vec))
