@@ -2,12 +2,16 @@
 Hybrid Search — BM25 + Metadata Cosine + Review Cosine → RRF Fusion.
 
 Three retrieval signals, merged via Reciprocal Rank Fusion (RRF).
-Embedding model loaded once at startup, query embeddings on-the-fly.
+Query embeddings are generated via the HuggingFace Inference API
+(BAAI/bge-base-en-v1.5) — no local model loaded, no GPU/RAM required.
 """
 from __future__ import annotations
 
 import logging
-from sentence_transformers import SentenceTransformer
+import math
+import os
+
+import httpx
 
 from app.core.config import settings
 from app.core.db import execute_query
@@ -15,24 +19,35 @@ from app.services.query_classifier import ClassifiedQuery
 
 logger = logging.getLogger(__name__)
 
-_model: SentenceTransformer | None = None
-
-
-def _get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        logger.info("Loading embedding model: %s", settings.embedding_model)
-        _model = SentenceTransformer(settings.embedding_model)
-        logger.info("Embedding model loaded.")
-    return _model
+# Same model used to generate the stored embeddings - must not change.
+_HF_API_URL = "https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-base-en-v1.5"
 
 
 def embed_query(text: str) -> list[float]:
-    """Encode a query string into a 768-dim vector."""
-    model = _get_model()
+    """Encode a query string into a 768-dim vector via HuggingFace Inference API.
+
+    Uses the same BAAI/bge-base-en-v1.5 model that generated the stored
+    embeddings, so cosine similarity is valid. Normalizes to unit vector
+    to match how stored embeddings were generated.
+    """
+    token = os.environ.get("HF_TOKEN", "")
     prefixed = "Represent this sentence for searching relevant passages: " + text
-    vec = model.encode(prefixed, normalize_embeddings=True)
-    return vec.tolist()
+
+    response = httpx.post(
+        _HF_API_URL,
+        headers={"Authorization": f"Bearer {token}"},
+        # wait_for_model=True: if HF's copy is cold, wait instead of returning 503.
+        json={"inputs": prefixed, "options": {"wait_for_model": True}},
+        timeout=30.0,
+    )
+    response.raise_for_status()
+    vec: list[float] = response.json()
+
+    # Normalize to unit vector - matches normalize_embeddings=True used during ingest.
+    norm = math.sqrt(sum(x * x for x in vec))
+    if norm > 0:
+        vec = [x / norm for x in vec]
+    return vec
 
 
 # ---------------------------------------------------------------------------

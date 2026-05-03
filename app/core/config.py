@@ -2,8 +2,9 @@
 Application settings — reads from the same .env file.
 
 Database connection: lib/db.get_connection() (reads DATABASE_URL_1)
-Query classifier:   lib/query_classifier.py (reads ANTHROPIC_API_KEY)
-RAG pipeline:       uses Groq (reads GROQ_API_KEY)
+Query classifier:   lib/query_classifier.py (reads GROQ_API_KEY)
+Embeddings:         app/services/search.py  (reads HF_TOKEN)
+RAG pipeline:       app/services/rag.py     (reads GROQ_API_KEY)
 """
 from __future__ import annotations
 
@@ -16,7 +17,7 @@ load_dotenv()
 
 @dataclass
 class Settings:
-    # --- Embeddings ---
+    # --- Embeddings (HuggingFace Inference API — no local model) ---
     embedding_model: str = "BAAI/bge-base-en-v1.5"
     embedding_dim: int = 768
 
