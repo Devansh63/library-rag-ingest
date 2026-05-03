@@ -632,9 +632,17 @@
         setDraft("");
         setLoading(true);
         try {
+          const t = text;
+          const wantExclude = lastBooks.length > 0 && (
+            t.length < 160 ||
+            /\b(more|another|different|others?|else|again|next|fetch|show\s+me\s+more|other\s+titles|more\s+books|keep\s+going|something\s+else)\b/i.test(t)
+          );
+          const exclude_isbn13 = wantExclude
+            ? [...new Set(lastBooks.map((b) => b.isbn13).filter(Boolean))]
+            : [];
           const data = await api("/recommend/chat", {
             method: "POST",
-            body: JSON.stringify({ messages: toSend, limit: 5 }),
+            body: JSON.stringify({ messages: toSend, limit: 5, exclude_isbn13 }),
           });
           if (Array.isArray(data.messages)) setMessages(data.messages);
           if (Array.isArray(data.books)) setLastBooks(data.books);

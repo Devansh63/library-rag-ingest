@@ -22,6 +22,8 @@ class RecommendChatBody(BaseModel):
 
     messages: list[ChatTurn] = Field(..., min_length=1)
     limit: int = Field(default=5, ge=1, le=10)
+    # When the reader asks for “more / different” picks, pass ISBNs already shown so retrieval can widen.
+    exclude_isbn13: list[str] = Field(default_factory=list, max_length=80)
 
 
 @router.get("/books/{isbn13}")
@@ -65,7 +67,10 @@ async def recommend(q: str = Query(..., min_length=3), limit: int = Query(defaul
 async def recommend_chat(body: RecommendChatBody):
     """Multi-turn librarian chat: retrieval each turn + Groq dialog."""
     payload = [{"role": t.role, "content": t.content} for t in body.messages]
-    result = await conversational_recommendations(payload, catalog_limit=body.limit)
+    exclude = [x.strip() for x in body.exclude_isbn13 if x and str(x).strip()]
+    result = await conversational_recommendations(
+        payload, catalog_limit=body.limit, exclude_isbn13=exclude
+    )
     if result.get("error") == "invalid_messages":
         raise HTTPException(status_code=400, detail=result.get("detail", "Invalid transcript."))
     return result
