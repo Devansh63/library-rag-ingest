@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from app.core.config import settings
 from app.core.db import execute_write
@@ -21,6 +24,8 @@ from app.routers import analytics, books, inventory, search
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+STATIC_DIR = Path(__file__).parent.parent / "static"
 
 
 def _ensure_search_infrastructure():
@@ -113,4 +118,18 @@ app.include_router(analytics.router)
 
 @app.get("/", tags=["health"])
 def root():
+    """Serve the frontend UI at root, or return JSON health check."""
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return FileResponse(index)
     return {"service": "Library RAG API", "status": "running", "docs": "/docs"}
+
+
+@app.get("/health", tags=["health"])
+def health():
+    return {"service": "Library RAG API", "status": "running", "docs": "/docs"}
+
+
+# Mount static files last so API routes take priority
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
