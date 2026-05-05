@@ -1,9 +1,8 @@
 """
-Hybrid Search — BM25 + Metadata Cosine + Review Cosine → RRF Fusion.
+Hybrid search: BM25 + metadata cosine + review cosine, merged via RRF.
 
-Three retrieval signals, merged via Reciprocal Rank Fusion (RRF).
-Query embeddings are generated via the HuggingFace Inference API
-(BAAI/bge-base-en-v1.5) — no local model loaded, no GPU/RAM required.
+Query embeddings go through the HuggingFace Inference API (BAAI/bge-base-en-v1.5).
+No local model - just an HTTP call.
 """
 from __future__ import annotations
 
@@ -19,55 +18,40 @@ from app.services.query_classifier import ClassifiedQuery
 
 logger = logging.getLogger(__name__)
 
-# Same model used to generate the stored embeddings - must not change.
-# Use the HF router endpoint - api-inference.huggingface.co/models/ returns 404 for BGE.
+# Must match the model used to generate stored embeddings.
+# router.huggingface.co is required - api-inference.huggingface.co returns 404 for BGE.
 _HF_API_URL = "https://router.huggingface.co/hf-inference/models/BAAI/bge-base-en-v1.5"
 
 
 def embed_query(text: str) -> list[float]:
-    """Encode a query string into a 768-dim vector via HuggingFace Inference API.
-
-    Uses the same BAAI/bge-base-en-v1.5 model that generated the stored
-    embeddings, so cosine similarity is valid. Normalizes to unit vector
-    to match how stored embeddings were generated.
-    """
+    """Encode a query string to a 768-dim unit vector via HF Inference API."""
     token = os.environ.get("HF_TOKEN", "")
+    # BGE query prefix - same one used during ingest for consistent similarity scores.
     prefixed = "Represent this sentence for searching relevant passages: " + text
 
     response = httpx.post(
         _HF_API_URL,
         headers={"Authorization": f"Bearer {token}"},
-        # Don't wait for cold model - fail fast and fall back to BM25 instead
-        # of blocking the search for 20-30 seconds.
         json={"inputs": prefixed},
-        timeout=8.0,
+        timeout=8.0,  # fail fast - cold model can take 20-30s, fall back to BM25 instead
     )
     response.raise_for_status()
 
-    # Router endpoint returns a flat list [float, ...] for a single string input.
-    # Unwrap if nested just in case.
     raw = response.json()
     vec: list[float] = raw[0] if isinstance(raw[0], list) else raw
 
-    # Normalize to unit vector - matches normalize_embeddings=True used during ingest.
     norm = math.sqrt(sum(x * x for x in vec))
     if norm > 0:
         vec = [x / norm for x in vec]
     return vec
 
 
-# ---------------------------------------------------------------------------
-# Individual retrieval signals
-# ---------------------------------------------------------------------------
-
 def bm25_search(query: str, limit: int = 50) -> list[dict]:
-    """BM25 keyword search using Postgres full-text search.
+    """BM25 via Postgres FTS (GIN index on search_tsv).
 
-    Only rows with ``search_tsv`` set participate in FTS (GIN index, no NULL
-    scan). ``MATERIALIZED`` CTEs keep the fallback branches from re-planning
-    the FTS leg. ISBN matches run in a separate cheap leg so we skip the
-    ILIKE/unnest scan when an ISBN hit exists. Run
-    ``scripts/backfill_search_tsv.py`` for full coverage.
+    Falls back to ISBN match, then ILIKE on embedded books only. The ILIKE
+    fallback is scoped to metadata_embedding IS NOT NULL to avoid scanning
+    all 962K rows when search_tsv hasn't been fully backfilled.
     """
     sql = """
         WITH q AS (
@@ -106,8 +90,6 @@ def bm25_search(query: str, limit: int = 50) -> list[dict]:
             FROM books b
             WHERE NOT EXISTS (SELECT 1 FROM fts)
               AND NOT EXISTS (SELECT 1 FROM isbn_fb)
-              -- Restrict to embedded books only - avoids full 962K table scan
-              -- when search_tsv has not been backfilled yet.
               AND b.metadata_embedding IS NOT NULL
               AND (
                   b.title ILIKE '%%' || %(query)s || '%%'
@@ -129,7 +111,7 @@ def bm25_search(query: str, limit: int = 50) -> list[dict]:
 
 
 def metadata_cosine_search(query_embedding: list[float], limit: int = 50) -> list[dict]:
-    """Semantic search against books.metadata_embedding."""
+    """Cosine search over books.metadata_embedding."""
     embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
     sql = """
         SELECT
@@ -145,10 +127,13 @@ def metadata_cosine_search(query_embedding: list[float], limit: int = 50) -> lis
 
 
 def review_cosine_search(query_embedding: list[float], limit: int = 50) -> list[dict]:
-    """Semantic search against review embeddings (pre-aggregated or runtime)."""
+    """Cosine search over books.review_embedding.
+
+    Falls back to averaging individual review vectors at runtime if
+    books.review_embedding hasn't been populated yet.
+    """
     embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
 
-    # Check if books.review_embedding has data
     check = execute_query(
         "SELECT EXISTS(SELECT 1 FROM books WHERE review_embedding IS NOT NULL LIMIT 1) AS has"
     )
@@ -167,7 +152,7 @@ def review_cosine_search(query_embedding: list[float], limit: int = 50) -> list[
         """
         return execute_query(sql, {"embedding": embedding_str, "limit": limit})
 
-    # Fallback: runtime aggregation from reviews table
+    # Runtime average fallback
     sql = """
         SELECT
             b.id, b.isbn13, b.title, b.authors, b.genres, b.synopsis,
@@ -189,10 +174,6 @@ def review_cosine_search(query_embedding: list[float], limit: int = 50) -> list[
     """
     return execute_query(sql, {"embedding": embedding_str, "limit": limit})
 
-
-# ---------------------------------------------------------------------------
-# RRF Fusion
-# ---------------------------------------------------------------------------
 
 def reciprocal_rank_fusion(
     ranked_lists: list[tuple[list[dict], float]],
@@ -222,12 +203,8 @@ def reciprocal_rank_fusion(
     return results
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
 def hybrid_search(classified: ClassifiedQuery, limit: int = 20, per_signal_limit: int = 50) -> list[dict]:
-    """Full hybrid search pipeline."""
+    """Run all active signals and fuse with RRF."""
     ranked_lists: list[tuple[list[dict], float]] = []
 
     if classified.weight_keyword > 0:

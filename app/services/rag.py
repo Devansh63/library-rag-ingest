@@ -1,9 +1,4 @@
-"""
-RAG Recommendation Pipeline — uses Groq API (free tier).
-
-Search → top-K books → LLM prompt → natural language recommendation.
-Falls back to structured list if no GROQ_API_KEY.
-"""
+"""RAG recommendation pipeline using Groq. Falls back to structured list if no key."""
 from __future__ import annotations
 
 import logging
@@ -15,8 +10,9 @@ from app.services.search import hybrid_search, keyword_only_search
 
 logger = logging.getLogger(__name__)
 
-_MAX_CHAT_TURNS_CLIENT = 32  # alternating user/assistant (each counts as one entry)
+_MAX_CHAT_TURNS_CLIENT = 32
 _SEARCH_BLURB_MAX = 600
+
 _LIBRARIAN_CHAT_SYSTEM = """\
 You are a friendly, witty librarian chatting with a reader in a natural back-and-forth (like ChatGPT).
 
@@ -29,18 +25,17 @@ IMPORTANT: Facts about specific books—titles, authors, stars, synopsis details
 know from the conversation and suggest they try a vaguer mood or genre; do not invent books.
 
 When they ask for **more / different / other** titles, assume the new catalog block may contain books you
-have not mentioned yet—do not insist the library “only” has what you listed in an earlier reply.
+have not mentioned yet—do not insist the library "only" has what you listed in an earlier reply.
 
 Respond as plain text/Markdown; no faux JSON."""
 
 
 def _collapse_adjacent_roles(turns: list[dict[str, str]]) -> list[dict[str, str]]:
-    """Groq prefers strict user/assistant alternation—merge back-to-back same roles."""
+    """Groq requires strict user/assistant alternation - merge consecutive same-role messages."""
     out: list[dict[str, str]] = []
     for m in turns:
         if out and out[-1]["role"] == m["role"]:
-            prev = out[-1]["content"]
-            out[-1] = {"role": m["role"], "content": prev + "\n\n" + m["content"]}
+            out[-1] = {"role": m["role"], "content": out[-1]["content"] + "\n\n" + m["content"]}
         else:
             out.append(dict(m))
     return out
@@ -97,8 +92,11 @@ _FOLLOWUP_MORE = re.compile(
 
 
 def _search_query_from_thread(messages: list[dict[str, str]]) -> str:
-    """Build retrieval text from user lines, **newest first within the char budget** (old tail-truncation
-    dropped early topics like “nature” after long threads)."""
+    """Build retrieval text from user messages, newest-first within the char budget.
+
+    Newest-first matters for long threads where early topics (e.g. "nature")
+    would otherwise dominate and pull results away from the current ask.
+    """
     chunks: list[str] = []
     for m in messages:
         if m.get("role") == "user":
@@ -107,6 +105,7 @@ def _search_query_from_thread(messages: list[dict[str, str]]) -> str:
                 chunks.append(t)
     if not chunks:
         return ""
+
     picked_rev: list[str] = []
     budget = 0
     for t in reversed(chunks):
@@ -117,7 +116,8 @@ def _search_query_from_thread(messages: list[dict[str, str]]) -> str:
         budget += add
     picked = list(reversed(picked_rev))
     joined = "\n".join(picked).strip()
-    # Short “more / different” follow-ups: anchor to the previous substantive user ask.
+
+    # Short "more / different" follow-ups: anchor to the previous substantive ask.
     last = chunks[-1]
     if len(chunks) >= 2 and (len(last) < 140 or _FOLLOWUP_MORE.search(last)):
         prev = chunks[-2]
@@ -129,19 +129,13 @@ def _search_query_from_thread(messages: list[dict[str, str]]) -> str:
 def _filter_excluded(books: list[dict], exclude: set[str]) -> list[dict]:
     if not exclude:
         return list(books)
-    out: list[dict] = []
-    for b in books:
-        isbn = str(b.get("isbn13") or "").strip()
-        if isbn and isbn in exclude:
-            continue
-        out.append(b)
-    return out
+    return [b for b in books if not (str(b.get("isbn13") or "").strip() in exclude)]
 
 
 def _enrich_with_keyword_diversity(
     classified, base: list[dict], exclude: set[str], want: int
 ) -> list[dict]:
-    """If exclusions thin out results, pull extra BM25 rows and merge by id."""
+    """Pull extra BM25 rows when exclusions thin out the result set."""
     if len(base) >= want or not classified.cleaned:
         return base
     try:
@@ -155,8 +149,7 @@ def _enrich_with_keyword_diversity(
         bid = b.get("id")
         if bid is None or int(bid) in seen:
             continue
-        isbn = str(b.get("isbn13") or "").strip()
-        if isbn and isbn in exclude:
+        if str(b.get("isbn13") or "").strip() in exclude:
             continue
         merged.append(b)
         seen.add(int(bid))
@@ -171,8 +164,7 @@ async def conversational_recommendations(
     catalog_limit: int,
     exclude_isbn13: list[str] | None = None,
 ) -> dict:
-    """Multi-turn librarian chat: fresh hybrid retrieval each user reply + Groq dialog."""
-
+    """Multi-turn librarian chat: fresh hybrid retrieval each user turn + Groq dialog."""
     sanitized: list[dict[str, str]] = []
     for m in messages:
         role = str(m.get("role", "")).lower().strip()
@@ -198,10 +190,7 @@ async def conversational_recommendations(
     search_q = _search_query_from_thread(sanitized)
     classified = classify_query(search_q[-500:] if search_q else "books")
 
-    fuse_cap = min(
-        56,
-        settings.rag_top_k + max(12, len(exclude_set) * 2),
-    )
+    fuse_cap = min(56, settings.rag_top_k + max(12, len(exclude_set) * 2))
     per_sig = min(100, 55 + len(exclude_set))
     books = hybrid_search(classified, limit=fuse_cap, per_signal_limit=per_sig)
     books = _filter_excluded(books, exclude_set)
@@ -228,7 +217,6 @@ async def conversational_recommendations(
                 "I'm not pulling strong catalogue hits yet—tell me softer constraints "
                 '(pace, comps, mood) or swap genre a bit and I\'ll hunt again!'
             )
-
         return {
             "messages": sanitized + [{"role": "assistant", "content": reply}],
             "assistant_reply": reply,
@@ -236,7 +224,6 @@ async def conversational_recommendations(
             "query_type": classified.query_type,
         }
 
-    # Keep excerpt block bounded so Groq still has room for long threads.
     ctx_books = books[: min(18, len(books))]
     context = _format_book_context(ctx_books)
     augmented = plain_last + (
@@ -261,7 +248,7 @@ async def conversational_recommendations(
 
 
 async def generate_recommendations(query: str, limit: int = 5) -> dict:
-    """Single-shot RAG pipeline: classify → search → retrieve → generate."""
+    """Single-shot RAG: classify -> search -> generate."""
     classified = classify_query(query)
     books = hybrid_search(classified, limit=settings.rag_top_k)
 
@@ -296,7 +283,7 @@ async def _call_groq_multiturn(
     prior_turns: list[dict[str, str]],
     final_user_payload: str,
 ) -> str:
-    """Groq Chat Completions with full thread + augmented final user bubble."""
+    """Send full conversation + augmented final user message to Groq."""
     from openai import AsyncOpenAI
 
     pt = list(prior_turns)
@@ -323,7 +310,6 @@ async def _call_groq_multiturn(
 
 
 async def _call_groq(query: str, context: str) -> str:
-    """Call Groq API for RAG recommendation. Uses OpenAI-compatible format."""
     from openai import AsyncOpenAI
 
     client = AsyncOpenAI(
@@ -331,13 +317,11 @@ async def _call_groq(query: str, context: str) -> str:
         base_url=settings.groq_base_url,
         timeout=90.0,
     )
-    prompt = _build_rag_prompt(query, context)
-
     response = await client.chat.completions.create(
         model=settings.rag_model,
         messages=[
             {"role": "system", "content": "You are a helpful librarian. Provide book recommendations based on catalog search results."},
-            {"role": "user", "content": prompt},
+            {"role": "user", "content": _build_rag_prompt(query, context)},
         ],
         max_tokens=800,
         temperature=0.7,

@@ -1,21 +1,16 @@
 """
-Query classifier for the hybrid search pipeline.
+Groq-based query classifier for the hybrid search pipeline.
 
-Uses Groq (Llama 3.1 8B Instant) to classify an incoming search query into
-one of four types, then returns per-signal RRF weights (BM25 + metadata
-embedding + review embedding) tuned for that query type.
-
-Why Groq: free tier, very low latency (~200ms), and classification is simple
-enough that a small fast model handles it reliably.
+Classifies a query into one of four types and returns per-signal RRF weights
+(BM25, metadata embedding, review embedding). Uses llama-3.1-8b-instant via
+Groq's free tier - fast enough (~200ms) to run on every search request.
 
 Usage:
     from lib.query_classifier import classify_query
     result = classify_query("dark atmospheric fantasy novels")
-    # result.query_type      -> "thematic"
-    # result.refined_query   -> "dark atmospheric fantasy novels"
-    # result.bm25_weight     -> 0.1
-    # result.metadata_weight -> 0.3
-    # result.review_weight   -> 0.6
+    # result.query_type    -> "thematic"
+    # result.bm25_weight   -> 0.1
+    # result.review_weight -> 0.6
 """
 
 from __future__ import annotations
@@ -35,9 +30,7 @@ _groq_client_sig: tuple[str, str, str] | None = None
 
 
 def _groq_base_url() -> str:
-    return (os.environ.get("GROQ_BASE_URL") or "https://api.groq.com/openai/v1").rstrip(
-        "/"
-    )
+    return (os.environ.get("GROQ_BASE_URL") or "https://api.groq.com/openai/v1").rstrip("/")
 
 
 def _classifier_model() -> str:
@@ -45,21 +38,14 @@ def _classifier_model() -> str:
 
 
 def _groq_client() -> OpenAI:
-    """Build or refresh client when ``GROQ_*`` env vars change (e.g. key rotation)."""
+    """Rebuild client when env vars change (e.g. key rotation in prod)."""
     global _groq_client_singleton, _groq_client_sig
-    sig = (
-        os.environ.get("GROQ_API_KEY", ""),
-        _groq_base_url(),
-        _classifier_model(),
-    )
+    sig = (os.environ.get("GROQ_API_KEY", ""), _groq_base_url(), _classifier_model())
     if _groq_client_singleton is None or _groq_client_sig != sig:
-        _groq_client_singleton = OpenAI(
-            base_url=sig[1],
-            api_key=sig[0],
-            timeout=60.0,
-        )
+        _groq_client_singleton = OpenAI(base_url=sig[1], api_key=sig[0], timeout=60.0)
         _groq_client_sig = sig
     return _groq_client_singleton
+
 
 _SYSTEM_PROMPT = """\
 You are a query classifier for a library book search and recommendation system.
@@ -94,7 +80,6 @@ did not imply.
 You must respond by calling the classify_query function.\
 """
 
-# OpenAI-format tool schema (Groq uses the same format).
 _CLASSIFY_TOOL = {
     "type": "function",
     "function": {
@@ -153,20 +138,11 @@ class QueryClassification:
 
 
 def classify_query(query: str) -> QueryClassification:
-    """Classify a search query and return RRF scoring weights.
-
-    Makes one Groq API call (free tier). Model: ``GROQ_CLASSIFIER_MODEL``
-    (default ``llama-3.1-8b-instant``).
-
-    Args:
-        query: Raw user search string.
-
-    Returns:
-        QueryClassification with query_type, refined_query, and per-signal weights.
+    """Classify a query and return RRF weights. Calls Groq once (free tier).
 
     Raises:
-        openai.APIError: On Groq / HTTP API failure.
-        ValueError: If the model returns no tool call or unexpected data.
+        openai.APIError: on Groq API failure.
+        ValueError: if the model returns no tool call.
     """
     response = _groq_client().chat.completions.create(
         model=_classifier_model(),
@@ -177,7 +153,6 @@ def classify_query(query: str) -> QueryClassification:
             {"role": "user", "content": query},
         ],
         tools=[_CLASSIFY_TOOL],
-        # Force the model to always call classify_query - no free-text fallback.
         tool_choice={"type": "function", "function": {"name": "classify_query"}},
     )
 
@@ -197,7 +172,7 @@ def classify_query(query: str) -> QueryClassification:
 
 
 if __name__ == "__main__":
-    # Quick smoke test - run with: uv run python lib/query_classifier.py
+    # Quick smoke test: uv run python lib/query_classifier.py
     test_queries = [
         "Harry Potter and the Chamber of Secrets",
         "dark atmospheric fantasy with morally grey characters",
@@ -207,8 +182,8 @@ if __name__ == "__main__":
     ]
     for q in test_queries:
         result = classify_query(q)
-        print(f"\nQuery:    {q}")
-        print(f"Type:     {result.query_type}")
-        print(f"Refined:  {result.refined_query}")
-        print(f"Weights:  BM25={result.bm25_weight}  metadata={result.metadata_weight}  review={result.review_weight}")
-        print(f"Reason:   {result.reasoning}")
+        print(f"\nQuery:   {q}")
+        print(f"Type:    {result.query_type}")
+        print(f"Refined: {result.refined_query}")
+        print(f"Weights: BM25={result.bm25_weight}  metadata={result.metadata_weight}  review={result.review_weight}")
+        print(f"Reason:  {result.reasoning}")

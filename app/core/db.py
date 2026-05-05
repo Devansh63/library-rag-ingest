@@ -5,10 +5,13 @@ from lib.db import get_connection
 
 
 def execute_query(sql: str, params: dict | tuple | list | None = None) -> list[dict]:
-    """Run a read query, return rows as dicts."""
+    """Run a SELECT, return rows as dicts."""
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            # Hard cap per query - prevents stray BM25 full-table scans from
+            # hanging the request when search_tsv isn't backfilled yet.
+            cur.execute("SET statement_timeout = '10s'")
             cur.execute(sql, params)
             return [dict(row) for row in cur.fetchall()]
     finally:
@@ -16,7 +19,7 @@ def execute_query(sql: str, params: dict | tuple | list | None = None) -> list[d
 
 
 def execute_write(sql: str, params: dict | tuple | list | None = None) -> int:
-    """Run a write query (INSERT/UPDATE), return rowcount."""
+    """Run an INSERT/UPDATE/DELETE, return rowcount."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -31,7 +34,7 @@ def execute_write(sql: str, params: dict | tuple | list | None = None) -> int:
 
 
 def execute_write_fetch(sql: str, params: dict | tuple | list | None = None) -> list[dict]:
-    """INSERT/UPDATE/DELETE with RETURNING — commit so rows persist."""
+    """INSERT/UPDATE/DELETE with RETURNING clause."""
     conn = get_connection()
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
