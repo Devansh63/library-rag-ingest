@@ -37,9 +37,10 @@ def embed_query(text: str) -> list[float]:
     response = httpx.post(
         _HF_API_URL,
         headers={"Authorization": f"Bearer {token}"},
-        # wait_for_model=True: if HF's copy is cold, wait instead of returning 503.
-        json={"inputs": prefixed, "options": {"wait_for_model": True}},
-        timeout=30.0,
+        # Don't wait for cold model - fail fast and fall back to BM25 instead
+        # of blocking the search for 20-30 seconds.
+        json={"inputs": prefixed},
+        timeout=8.0,
     )
     response.raise_for_status()
 
@@ -105,6 +106,9 @@ def bm25_search(query: str, limit: int = 50) -> list[dict]:
             FROM books b
             WHERE NOT EXISTS (SELECT 1 FROM fts)
               AND NOT EXISTS (SELECT 1 FROM isbn_fb)
+              -- Restrict to embedded books only - avoids full 962K table scan
+              -- when search_tsv has not been backfilled yet.
+              AND b.metadata_embedding IS NOT NULL
               AND (
                   b.title ILIKE '%%' || %(query)s || '%%'
                   OR EXISTS (
