@@ -98,8 +98,11 @@ async def lifespan(app: FastAPI):
     conn = get_connection()
     conn.close()
     logger.info("Database OK.")
-    _ensure_search_infrastructure()
-    logger.info("Search infrastructure ready.")
+    # Run schema setup in background — HNSW index creation can be slow
+    # and must not block the startup sequence on Render free tier.
+    import threading
+    threading.Thread(target=_ensure_search_infrastructure, daemon=True).start()
+    logger.info("Search infrastructure initializing in background.")
     if settings.groq_api_key:
         logger.info("Groq API key found — RAG recommendations enabled.")
     else:
